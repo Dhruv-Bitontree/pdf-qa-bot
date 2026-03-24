@@ -1,0 +1,18 @@
+{
+  "name": "pdf-qa-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PDF-based Q&A Chatbot with Advanced RAG and Multimodal Support",
+  "workspaces": ["server", "frontend"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:frontend\"",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "test": "npm run test --workspace=server && npm run test --workspace=frontend",
+    "test:server": "npm run test --workspace=server",
+    "test:frontend": "npm run test --workspace=frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
