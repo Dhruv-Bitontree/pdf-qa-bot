@@ -11,9 +11,15 @@ interface DocumentListProps {
   documents: Document[];
   onOpen: (doc: Document) => void;
   onDelete: (doc: Document) => void;
+  deletingDocumentId?: number | null;
 }
 
-export function DocumentList({ documents, onOpen, onDelete }: DocumentListProps) {
+export function DocumentList({
+  documents,
+  onOpen,
+  onDelete,
+  deletingDocumentId = null,
+}: DocumentListProps) {
   if (documents.length === 0) {
     return (
       <div className="text-center py-12 text-muted-foreground">
@@ -36,8 +42,8 @@ export function DocumentList({ documents, onOpen, onDelete }: DocumentListProps)
             <div className="min-w-0">
               <p className="font-medium truncate">{doc.original_name}</p>
               <p className="text-xs text-muted-foreground">
-                {formatFileSize(doc.file_size)} &middot; {doc.page_count} pages &middot;{" "}
-                {formatDate(doc.created_at)}
+                {formatFileSize(doc.file_size)} &middot; {doc.page_count} pages
+                &middot; {formatDate(doc.created_at)}
               </p>
             </div>
           </div>
@@ -46,12 +52,17 @@ export function DocumentList({ documents, onOpen, onDelete }: DocumentListProps)
             <Button
               variant="ghost"
               size="icon"
+              disabled={deletingDocumentId === doc.id}
               onClick={(e) => {
                 e.stopPropagation();
                 onDelete(doc);
               }}
             >
-              <Trash2 className="h-4 w-4 text-muted-foreground" />
+              {deletingDocumentId === doc.id ? (
+                <Loader2 className="h-4 w-4 text-muted-foreground animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4 text-muted-foreground" />
+              )}
             </Button>
           </div>
         </Card>

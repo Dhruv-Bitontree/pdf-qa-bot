@@ -44,25 +44,22 @@ export function tokenize(text) {
 export function buildIndex(db, documentId, chunks) {
   const insertTerm = db.prepare('INSERT INTO term_index (term, chunk_id, tf) VALUES (?, ?, ?)');
 
-  const buildAll = db.transaction(() => {
-    for (const chunk of chunks) {
-      const tokens = tokenize(chunk.content);
-      if (tokens.length === 0) continue;
+  // Insert all terms (no transaction wrapper needed with sql.js)
+  for (const chunk of chunks) {
+    const tokens = tokenize(chunk.content);
+    if (tokens.length === 0) continue;
 
-      // Compute term frequencies
-      const termCounts = {};
-      for (const token of tokens) {
-        termCounts[token] = (termCounts[token] || 0) + 1;
-      }
-
-      // Normalize TF by total token count
-      for (const [term, count] of Object.entries(termCounts)) {
-        insertTerm.run(term, chunk.id, count / tokens.length);
-      }
+    // Compute term frequencies
+    const termCounts = {};
+    for (const token of tokens) {
+      termCounts[token] = (termCounts[token] || 0) + 1;
     }
-  });
 
-  buildAll();
+    // Normalize TF by total token count
+    for (const [term, count] of Object.entries(termCounts)) {
+      insertTerm.run(term, chunk.id, count / tokens.length);
+    }
+  }
 }
 
 /**

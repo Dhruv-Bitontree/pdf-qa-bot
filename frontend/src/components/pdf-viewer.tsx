@@ -12,7 +12,12 @@ interface PdfViewerProps {
   focusPage?: number | null;
 }
 
-export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfViewerProps) {
+export function PdfViewer({
+  fileUrl,
+  token,
+  highlights = [],
+  focusPage,
+}: PdfViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [pdf, setPdf] = useState<any>(null);
@@ -21,6 +26,7 @@ export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfVie
   const [scale, setScale] = useState(1.2);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [lastFocusedPage, setLastFocusedPage] = useState<number | null>(null);
 
   // Load PDF
   useEffect(() => {
@@ -56,12 +62,15 @@ export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfVie
     }
 
     loadPdf();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [fileUrl, token]);
 
   // Navigate to focused page
   useEffect(() => {
     if (focusPage && focusPage >= 1 && focusPage <= totalPages) {
+      setLastFocusedPage(focusPage);
       setCurrentPage(focusPage);
     }
   }, [focusPage, totalPages]);
@@ -77,26 +86,21 @@ export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfVie
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(viewport.width * dpr);
+      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
 
-      await page.render({ canvasContext: ctx, viewport }).promise;
-
-      // Draw highlight overlays
-      const pageHighlights = highlights.filter((h) => h.page_number === currentPage);
-      if (pageHighlights.length > 0) {
-        ctx.fillStyle = "rgba(254, 240, 138, 0.4)";
-        // Simple highlight: draw a band for each source on this page
-        const bandHeight = viewport.height / 10;
-        pageHighlights.forEach((h, i) => {
-          const y = Math.min(i * bandHeight * 2, viewport.height - bandHeight);
-          ctx.fillRect(10, y, viewport.width - 20, bandHeight);
-        });
-      }
+      await page.render({
+        canvasContext: ctx,
+        viewport,
+        transform: dpr === 1 ? undefined : [dpr, 0, 0, dpr, 0, 0],
+      }).promise;
     } catch (err) {
       console.error("Error rendering page:", err);
     }
-  }, [pdf, currentPage, scale, highlights]);
+  }, [pdf, currentPage, scale]);
 
   useEffect(() => {
     renderPage();
@@ -143,6 +147,11 @@ export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfVie
             <ChevronRight className="h-4 w-4" />
           </Button>
         </div>
+        {lastFocusedPage === currentPage && highlights.length > 0 && (
+          <span className="text-xs text-muted-foreground">
+            Showing source page {currentPage}
+          </span>
+        )}
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
@@ -165,7 +174,10 @@ export function PdfViewer({ fileUrl, token, highlights = [], focusPage }: PdfVie
       </div>
 
       {/* Canvas */}
-      <div ref={containerRef} className="flex-1 overflow-auto flex justify-center p-4 bg-muted/30">
+      <div
+        ref={containerRef}
+        className="flex-1 overflow-auto flex justify-center p-4 bg-muted/30"
+      >
         <canvas ref={canvasRef} className="shadow-lg" />
       </div>
     </div>

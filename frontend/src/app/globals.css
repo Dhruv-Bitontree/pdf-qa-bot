@@ -24,3 +24,17 @@
     color: var(--color-foreground);
   }
 }
+
+@keyframes upload-progress-sweep {
+  0% {
+    transform: translateX(-140%);
+  }
+  100% {
+    transform: translateX(330%);
+  }
+}
+
+.upload-progress-sweep {
+  animation: upload-progress-sweep 1.2s linear infinite;
+  will-change: transform;
+}

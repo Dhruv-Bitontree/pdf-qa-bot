@@ -1,9 +1,10 @@
+import 'dotenv/config';
 import { createApp } from './app.js';
 import { createDb } from './db.js';
 
 const PORT = process.env.PORT || 3001;
 
-const db = createDb();
+const db = await createDb();
 const app = createApp(db);
 
 app.listen(PORT, () => {

@@ -7,10 +7,17 @@ class ApiClient {
     this.token = token;
   }
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  private async request<T>(
+    path: string,
+    options: RequestInit = {},
+  ): Promise<T> {
     const headers: Record<string, string> = {
       ...(options.headers as Record<string, string>),
     };
+
+    if (!this.token && typeof window !== "undefined") {
+      this.token = localStorage.getItem("pdf-qa-token");
+    }
 
     if (this.token) {
       headers["Authorization"] = `Bearer ${this.token}`;
@@ -79,7 +86,9 @@ class ApiClient {
 
   // Conversations
   async getConversations(documentId: number) {
-    return this.request<Conversation[]>(`/conversations/document/${documentId}`);
+    return this.request<Conversation[]>(
+      `/conversations/document/${documentId}`,
+    );
   }
 
   async createConversation(documentId: number, title?: string) {
@@ -89,8 +98,14 @@ class ApiClient {
     });
   }
 
-  async getMessages(conversationId: number) {
-    return this.request<Message[]>(`/conversations/${conversationId}/messages`);
+  async getMessages(conversationId: number, limit?: number) {
+    const query =
+      typeof limit === "number" && limit > 0
+        ? `?limit=${Math.trunc(limit)}`
+        : "";
+    return this.request<Message[]>(
+      `/conversations/${conversationId}/messages${query}`,
+    );
   }
 
   // Chat
@@ -128,6 +143,8 @@ export interface Conversation {
   document_id: number;
   title: string;
   created_at: string;
+  message_count?: number;
+  last_message_at?: string | null;
 }
 
 export interface Source {

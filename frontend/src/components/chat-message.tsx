@@ -11,6 +11,11 @@ interface ChatMessageProps {
 
 export function ChatMessage({ message, onSourceClick }: ChatMessageProps) {
   const isUser = message.role === "user";
+  const uniqueSources =
+    message.sources?.filter(
+      (source, index, arr) =>
+        arr.findIndex((s) => s.page_number === source.page_number) === index,
+    ) || [];
 
   return (
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
@@ -23,17 +28,17 @@ export function ChatMessage({ message, onSourceClick }: ChatMessageProps) {
       </div>
       <div
         className={`max-w-[80%] rounded-lg px-4 py-3 ${
-          isUser
-            ? "bg-primary text-primary-foreground"
-            : "bg-muted"
+          isUser ? "bg-primary text-primary-foreground" : "bg-muted"
         }`}
       >
-        <div className="text-sm whitespace-pre-wrap break-words">{message.content}</div>
+        <div className="text-sm whitespace-pre-wrap break-words">
+          {message.content}
+        </div>
 
         {/* Source references */}
-        {message.sources && message.sources.length > 0 && (
+        {uniqueSources.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-border/30">
-            {message.sources.map((source, i) => (
+            {uniqueSources.map((source, i) => (
               <Badge
                 key={i}
                 variant="outline"

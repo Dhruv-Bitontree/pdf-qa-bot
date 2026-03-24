@@ -12,38 +12,122 @@ interface ChatInterfaceProps {
   onSourceClick?: (source: Source) => void;
 }
 
-export function ChatInterface({ documentId, onSourceClick }: ChatInterfaceProps) {
+const MESSAGE_WINDOW_SIZE = 10;
+const CHAT_DROPDOWN_LIMIT = 5;
+
+export function ChatInterface({
+  documentId,
+  onSourceClick,
+}: ChatInterfaceProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
+  const [conversationsLoaded, setConversationsLoaded] = useState(false);
+  const [activeConversation, setActiveConversation] =
+    useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  const conversationStorageKey = `pdf-qa-active-conversation-${documentId}`;
+  const recentConversations = conversations.slice(0, CHAT_DROPDOWN_LIMIT);
+  const activeConversationId =
+    activeConversation?.id ?? recentConversations[0]?.id ?? "";
+
   // Load conversations
   useEffect(() => {
-    api.getConversations(documentId).then(setConversations).catch(console.error);
+    let cancelled = false;
+
+    setConversations([]);
+    setActiveConversation(null);
+    setMessages([]);
+    setConversationsLoaded(false);
+
+    api
+      .getConversations(documentId)
+      .then((data) => {
+        if (!cancelled) {
+          setConversations(data);
+        }
+      })
+      .catch(console.error)
+      .finally(() => {
+        if (!cancelled) {
+          setConversationsLoaded(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [documentId]);
 
-  // Auto-create conversation if none exist
+  // Resolve active conversation after conversations are loaded.
   useEffect(() => {
+    if (!conversationsLoaded) {
+      return;
+    }
+
     if (conversations.length === 0) {
       api
         .createConversation(documentId, "Chat")
         .then((conv) => {
           setConversations([conv]);
           setActiveConversation(conv);
+          localStorage.setItem(conversationStorageKey, String(conv.id));
         })
         .catch(console.error);
-    } else if (!activeConversation) {
+      return;
+    }
+
+    if (!activeConversation) {
+      const savedConversationId = Number(
+        localStorage.getItem(conversationStorageKey),
+      );
+      const savedConversation = conversations.find(
+        (c) => c.id === savedConversationId,
+      );
+
+      const conversationWithHistory = conversations.find(
+        (c) => (c.message_count || 0) > 0,
+      );
+
+      setActiveConversation(
+        savedConversation || conversationWithHistory || conversations[0],
+      );
+      return;
+    }
+
+    const stillExists = conversations.some(
+      (c) => c.id === activeConversation.id,
+    );
+    if (!stillExists) {
       setActiveConversation(conversations[0]);
     }
-  }, [conversations, documentId, activeConversation]);
+  }, [
+    conversations,
+    documentId,
+    activeConversation,
+    conversationsLoaded,
+    conversationStorageKey,
+  ]);
+
+  // Persist active conversation per document.
+  useEffect(() => {
+    if (activeConversation) {
+      localStorage.setItem(
+        conversationStorageKey,
+        String(activeConversation.id),
+      );
+    }
+  }, [activeConversation, conversationStorageKey]);
 
   // Load messages when conversation changes
   useEffect(() => {
     if (activeConversation) {
-      api.getMessages(activeConversation.id).then(setMessages).catch(console.error);
+      api
+        .getMessages(activeConversation.id, MESSAGE_WINDOW_SIZE)
+        .then(setMessages)
+        .catch(console.error);
     }
   }, [activeConversation]);
 
@@ -71,13 +155,24 @@ export function ChatInterface({ documentId, onSourceClick }: ChatInterfaceProps)
     setMessages((prev) => [...prev, tempUserMsg]);
 
     try {
-      const response = await api.sendMessage(activeConversation.id, userMessage);
+      const response = await api.sendMessage(
+        activeConversation.id,
+        userMessage,
+      );
       // Replace temp message with actual and add assistant response
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        response.userMessage,
-        response.assistantMessage,
-      ]);
+      setMessages((prev) =>
+        [
+          ...prev.slice(0, -1),
+          response.userMessage,
+          response.assistantMessage,
+        ].slice(-MESSAGE_WINDOW_SIZE),
+      );
+
+      // Refresh conversation metadata so dropdown order reflects latest activity.
+      api
+        .getConversations(documentId)
+        .then(setConversations)
+        .catch(console.error);
     } catch (err) {
       // Add error message
       setMessages((prev) => [
@@ -111,10 +206,35 @@ export function ChatInterface({ documentId, onSourceClick }: ChatInterfaceProps)
     <div className="flex flex-col h-full">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-muted/50 shrink-0">
-        <h3 className="font-medium text-sm">Chat</h3>
+        <div className="flex items-center gap-2 min-w-0">
+          <h3 className="font-medium text-sm">Chat</h3>
+          <select
+            aria-label="Recent chats"
+            className="h-8 rounded-md border border-border bg-background px-2 text-xs max-w-[210px]"
+            value={activeConversationId}
+            onChange={(e) => {
+              const selectedId = Number(e.target.value);
+              const selected = conversations.find((c) => c.id === selectedId);
+              if (selected) {
+                setActiveConversation(selected);
+              }
+            }}
+            disabled={recentConversations.length === 0}
+          >
+            {recentConversations.map((conv, index) => {
+              const when = conv.last_message_at || conv.created_at;
+              const label = `${index + 1}. ${new Date(when).toLocaleString()}`;
+              return (
+                <option key={conv.id} value={conv.id}>
+                  {label}
+                </option>
+              );
+            })}
+          </select>
+        </div>
         <Button variant="ghost" size="sm" onClick={handleNewConversation}>
           <Plus className="h-4 w-4 mr-1" />
-          New
+          Chat
         </Button>
       </div>
 

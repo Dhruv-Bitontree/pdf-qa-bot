@@ -6,6 +6,7 @@ import { createAuthRoutes } from './routes/auth.js';
 import { createDocumentRoutes } from './routes/documents.js';
 import { createConversationRoutes } from './routes/conversations.js';
 import { createChatRoutes } from './routes/chat.js';
+import { createSearchRoutes } from './routes/search.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -24,6 +25,7 @@ export function createApp(db) {
   app.use('/api/auth', createAuthRoutes(db));
   app.use('/api/documents', createDocumentRoutes(db));
   app.use('/api/conversations', createConversationRoutes(db));
+  app.use('/api/search', createSearchRoutes());
   app.use('/api', createChatRoutes(db));
 
   // Error handler

@@ -14,6 +14,9 @@ export default function DashboardPage() {
   const router = useRouter();
   const [documents, setDocuments] = useState<Document[]>([]);
   const [loadingDocs, setLoadingDocs] = useState(true);
+  const [deletingDocumentId, setDeletingDocumentId] = useState<number | null>(
+    null,
+  );
 
   const fetchDocuments = useCallback(async () => {
     try {
@@ -46,12 +49,16 @@ export default function DashboardPage() {
   if (loading || !user) return null;
 
   async function handleDelete(doc: Document) {
+    if (deletingDocumentId !== null) return;
     if (!confirm(`Delete "${doc.original_name}"?`)) return;
     try {
+      setDeletingDocumentId(doc.id);
       await api.deleteDocument(doc.id);
-      fetchDocuments();
+      await fetchDocuments();
     } catch (err) {
       console.error(err);
+    } finally {
+      setDeletingDocumentId(null);
     }
   }
 
@@ -66,7 +73,14 @@ export default function DashboardPage() {
           </div>
           <div className="flex items-center gap-3">
             <span className="text-sm text-muted-foreground">{user.name}</span>
-            <Button variant="ghost" size="sm" onClick={() => { logout(); router.push("/"); }}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                logout();
+                router.push("/");
+              }}
+            >
               <LogOut className="h-4 w-4 mr-1" />
               Sign out
             </Button>
@@ -90,6 +104,7 @@ export default function DashboardPage() {
               documents={documents}
               onOpen={(doc) => router.push(`/dashboard/${doc.id}`)}
               onDelete={handleDelete}
+              deletingDocumentId={deletingDocumentId}
             />
           )}
         </div>
