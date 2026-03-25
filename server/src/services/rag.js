@@ -75,10 +75,6 @@ const VISUAL_KEYWORDS = [
   "motorcycle",
   "bus",
   "truck",
-  "look",
-  "appear",
-  "show",
-  "display",
 ];
 
 const VISUAL_NEGATION_PATTERNS = [
@@ -155,9 +151,9 @@ export async function generateAnswer(
 ) {
   // Persist user message
   const insertMsg = db.prepare(
-    "INSERT INTO messages (conversation_id, role, content, sources) VALUES (?, ?, ?, ?)",
+    "INSERT INTO messages (conversation_id, role, content, sources, images) VALUES (?, ?, ?, ?, ?)",
   );
-  insertMsg.run(conversationId, "user", userMessage, null);
+  insertMsg.run(conversationId, "user", userMessage, null, null);
 
   const savedUserMsg = db
     .prepare(
@@ -176,6 +172,7 @@ export async function generateAnswer(
   // Retrieve relevant chunks
   // ------------------------------------------------------------------
   const searchMode = process.env.SEARCH_MODE || "hybrid";
+  const answerMode = detectAnswerMode(userMessage);
   const isVisualQuery = detectVisualQuery(retrievalQuery);
 
   // For visual queries fetch more candidates so vision chunks have a
@@ -196,12 +193,18 @@ export async function generateAnswer(
   if (isVisualQuery) {
     augmentedResults = await augmentWithVisionChunks(db, documentId, results);
   }
+  augmentedResults = filterResultsForQueryIntent(
+    db,
+    augmentedResults,
+    isVisualQuery,
+  );
 
   // ------------------------------------------------------------------
   // Build answer
   // ------------------------------------------------------------------
   let answerContent;
   let sources;
+  let images = [];
 
   if (augmentedResults.length === 0) {
     answerContent =
@@ -219,24 +222,29 @@ export async function generateAnswer(
     }));
 
     sources = dedupeSourcesByPage(rawSources);
+    if (isVisualQuery) {
+      sources = enrichSourcesWithImages(db, documentId, sources);
+      images = selectImagesForResponse(db, documentId, sources, true);
+    }
 
     const geminiApiKey = process.env.GEMINI_API_KEY;
 
     if (geminiApiKey) {
-      const handledVisualPresence =
-        isVisualQuery && buildVisualPresenceAnswer(userMessage, sources);
-
-      answerContent =
-        handledVisualPresence ||
-        (await generateWithGemini(
-          userMessage,
-          sources,
-          geminiApiKey,
-          isVisualQuery,
-          conversationContext,
-        ));
+      answerContent = await generateWithGemini(
+        userMessage,
+        sources,
+        geminiApiKey,
+        isVisualQuery,
+        conversationContext,
+        answerMode,
+        db,
+        documentId,
+      );
     } else {
-      answerContent = buildExtractiveAnswer(userMessage, sources);
+      answerContent =
+        answerMode === "overview"
+          ? buildOverviewAnswer(sources)
+          : buildExtractiveAnswer(userMessage, sources);
     }
   }
 
@@ -246,6 +254,7 @@ export async function generateAnswer(
     "assistant",
     answerContent,
     sources ? JSON.stringify(sources) : null,
+    images.length > 0 ? JSON.stringify(images) : null,
   );
 
   const savedAssistantMsg = db
@@ -259,6 +268,7 @@ export async function generateAnswer(
     assistantMessage: {
       ...savedAssistantMsg,
       sources: sources || [],
+      images,
     },
   };
 }
@@ -355,6 +365,55 @@ function buildExtractiveAnswer(question, sources) {
 }
 
 /**
+ * Build short (1-2 lines) overview answer for generic document-summary asks.
+ * @param {Array<{page_number:number,snippet:string}>} sources
+ * @returns {string}
+ */
+function buildOverviewAnswer(sources) {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return "I couldn't find enough information in the uploaded PDF to summarize it yet.";
+  }
+
+  const best = sources[0];
+  const snippet = String(best.snippet || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[\.;:,\-\s]+$/, "");
+
+  const compact = snippet.split(/[.!?]/)[0].trim().slice(0, 70);
+  return `This document is about ${compact}.`;
+}
+
+/**
+ * Detect whether user is asking for short overview vs detailed explanation.
+ * @param {string} question
+ * @returns {"overview"|"detailed"}
+ */
+function detectAnswerMode(question) {
+  const q = String(question || "")
+    .toLowerCase()
+    .trim();
+
+  if (
+    /(explain|elaborate|detail|detailed|in depth|deep dive|break down|step by step)/.test(
+      q,
+    )
+  ) {
+    return "detailed";
+  }
+
+  if (
+    /(what\s+(is\s+)?(this\s+)?(document|pdf|doc)\s+(is\s+)?about|what\s+this\s+(document|pdf|doc)\s+about|what['’]?s\s+this\s+(document|pdf|doc)\s+about|which\s+animal|what\s+animal|overview|summary|summarize|brief|short|tl;dr|gist)/.test(
+      q,
+    )
+  ) {
+    return "overview";
+  }
+
+  return "detailed";
+}
+
+/**
  * Generate a synthesised answer using Gemini via Langchain.
  *
  * @param {string} question
@@ -369,10 +428,55 @@ async function generateWithGemini(
   apiKey,
   isVisualQuery = false,
   conversationContext = [],
+  answerMode = "detailed",
+  db = null,
+  documentId = null,
 ) {
-  const context = sources
-    .map((r, i) => `[Source ${i + 1}, Page ${r.page_number}]: ${r.snippet}`)
-    .join("\n\n");
+  // For visual queries: pull actual vision chunk content from DB and inject
+  // it into the context so Gemini sees the real image descriptions.
+  let visionContext = "";
+  if (isVisualQuery && db && documentId) {
+    const visionChunks = db
+      .prepare(
+        `SELECT content, page_number FROM chunks
+         WHERE document_id = ? AND chunk_type = 'vision'
+         ORDER BY page_number ASC`,
+      )
+      .all(documentId);
+
+    if (visionChunks.length > 0) {
+      visionContext =
+        "\n\nVision descriptions of document pages (AI-generated):\n" +
+        visionChunks
+          .map((c) => `[Vision Page ${c.page_number}]: ${c.content}`)
+          .join("\n\n");
+    }
+
+    // Also pull context_text from extracted_images if available
+    const imageRows = db
+      .prepare(
+        `SELECT page_number, context_text FROM extracted_images
+         WHERE document_id = ? AND context_text IS NOT NULL AND TRIM(context_text) <> ''
+         ORDER BY id ASC`,
+      )
+      .all(documentId);
+
+    if (imageRows.length > 0) {
+      visionContext +=
+        "\n\nExtracted image descriptions:\n" +
+        imageRows
+          .map(
+            (r) =>
+              `[Image Page ${r.page_number}]: ${String(r.context_text).trim().slice(0, 800)}`,
+          )
+          .join("\n");
+    }
+  }
+
+  const context =
+    sources
+      .map((r, i) => `[Source ${i + 1}, Page ${r.page_number}]: ${r.snippet}`)
+      .join("\n\n") + visionContext;
 
   const allowedPages = [...new Set(sources.map((s) => s.page_number))].join(
     ", ",
@@ -391,6 +495,12 @@ async function generateWithGemini(
         `If context is still ambiguous, ask for clarification instead of guessing.\n`
       : "";
 
+  const answerLengthInstruction =
+    answerMode === "overview"
+      ? `- This is an abstract/overview query. Answer in 1-2 short lines (max 16 words total), direct and to the point.\n` +
+        `- Do not use bullets. Do not include extra detail unless explicitly asked.\n`
+      : `- Prefer clear but complete explanation when user asks for details.\n`;
+
   const prompt =
     `You are an expert assistant answering questions about a PDF document.\n` +
     `Answer the user's question using ONLY the provided document excerpts.\n\n` +
@@ -399,6 +509,8 @@ async function generateWithGemini(
     `- You may ONLY cite pages from this exact list: ${allowedPages}.\n` +
     `- Do NOT invent page numbers or cite pages not in that list.\n` +
     `- If the excerpts do not contain enough information, say so clearly.\n` +
+    `- For abstract overview questions (for example: what this document is about), keep it short and sweet.\n` +
+    `${answerLengthInstruction}` +
     `- Do not speculate beyond what the excerpts state.` +
     `${visualInstruction}\n\n` +
     `${conversationInstruction}` +
@@ -430,6 +542,9 @@ async function generateWithGemini(
         allowedPageSet,
       );
       const cleaned = stripSuggestedPagesFooter(normalized);
+      if (answerMode === "overview") {
+        return cleaned;
+      }
       return `${cleaned}\n\n${formatSuggestedPages(sources)}`;
     } catch (err) {
       lastError = err;
@@ -604,6 +719,136 @@ function stripSuggestedPagesFooter(text) {
     .replace(/^\s*Suggested pages\s*:[^\n]*$/gim, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/**
+ * Attach image metadata to sources where an extracted image exists for the same page.
+ * @param {object} db
+ * @param {number} documentId
+ * @param {Array<object>} sources
+ * @returns {Array<object>}
+ */
+function enrichSourcesWithImages(db, documentId, sources) {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return sources;
+  }
+
+  const images = db
+    .prepare(
+      `SELECT id, page_number, width, height, file_size
+       FROM extracted_images
+       WHERE document_id = ?
+       ORDER BY id ASC`,
+    )
+    .all(documentId);
+
+  if (images.length === 0) {
+    return sources;
+  }
+
+  const imageByPage = new Map();
+  for (const image of images) {
+    const page = Number(image.page_number || 0);
+    if (!page || imageByPage.has(page)) continue;
+    imageByPage.set(page, image);
+  }
+
+  return sources.map((source) => {
+    const image = imageByPage.get(Number(source.page_number || 0));
+    if (!image) {
+      return source;
+    }
+
+    return {
+      ...source,
+      image_id: Number(image.id),
+      image_preview_url: `/documents/${documentId}/images/${image.id}/preview`,
+      image_download_url: `/documents/${documentId}/images/${image.id}/download`,
+      image_width: Number(image.width || 0) || null,
+      image_height: Number(image.height || 0) || null,
+      image_size: Number(image.file_size || 0) || null,
+    };
+  });
+}
+
+/**
+ * Select image cards to include in assistant response.
+ * @param {object} db
+ * @param {number} documentId
+ * @param {Array<object>} sources
+ * @param {boolean} isVisualQuery
+ * @returns {Array<object>}
+ */
+function selectImagesForResponse(db, documentId, sources, isVisualQuery) {
+  if (!isVisualQuery) {
+    return [];
+  }
+
+  const fromSources = (sources || [])
+    .filter((s) => Number(s.image_id) > 0)
+    .map((s) => ({
+      id: Number(s.image_id),
+      page_number: Number(s.page_number || 0) || null,
+      preview_url: String(s.image_preview_url || ""),
+      download_url: String(s.image_download_url || ""),
+      width: Number(s.image_width || 0) || null,
+      height: Number(s.image_height || 0) || null,
+      file_size: Number(s.image_size || 0) || null,
+    }));
+
+  const dedup = [];
+  const seen = new Set();
+  for (const item of fromSources) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    dedup.push(item);
+  }
+
+  if (dedup.length > 0) {
+    return dedup.slice(0, 3);
+  }
+
+  return db
+    .prepare(
+      `SELECT id, page_number, width, height, file_size
+       FROM extracted_images
+       WHERE document_id = ?
+       ORDER BY id ASC
+       LIMIT 3`,
+    )
+    .all(documentId)
+    .map((img) => ({
+      id: Number(img.id),
+      page_number: Number(img.page_number || 0) || null,
+      preview_url: `/documents/${documentId}/images/${img.id}/preview`,
+      download_url: `/documents/${documentId}/images/${img.id}/download`,
+      width: Number(img.width || 0) || null,
+      height: Number(img.height || 0) || null,
+      file_size: Number(img.file_size || 0) || null,
+    }));
+}
+
+/**
+ * For non-visual queries, reduce false page attribution by preferring text chunks.
+ * @param {object} db
+ * @param {Array<object>} results
+ * @param {boolean} isVisualQuery
+ * @returns {Array<object>}
+ */
+function filterResultsForQueryIntent(db, results, isVisualQuery) {
+  if (isVisualQuery || !Array.isArray(results) || results.length === 0) {
+    return results;
+  }
+
+  const enriched = results.map((result) => {
+    const row = db
+      .prepare("SELECT chunk_type FROM chunks WHERE id = ?")
+      .get(result.chunk_id);
+    return { ...result, chunk_type: row?.chunk_type || "text" };
+  });
+
+  const textFirst = enriched.filter((r) => r.chunk_type !== "vision");
+  return textFirst.length > 0 ? textFirst : enriched;
 }
 
 // ---------------------------------------------------------------------------

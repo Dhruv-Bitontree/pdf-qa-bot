@@ -49,9 +49,17 @@ export async function createDb(dbPath) {
       user_id INTEGER NOT NULL,
       filename TEXT NOT NULL,
       original_name TEXT NOT NULL,
+      ai_title_short TEXT,
+      ai_summary TEXT,
       file_size INTEGER NOT NULL,
       page_count INTEGER DEFAULT 0,
       status TEXT DEFAULT 'processing' CHECK(status IN ('processing','ready','error')),
+      progress_percent REAL DEFAULT 0,
+      processing_stage TEXT,
+      status_message TEXT,
+      chunks_total INTEGER DEFAULT 0,
+      chunks_processed INTEGER DEFAULT 0,
+      extracted_image_count INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
@@ -95,9 +103,27 @@ export async function createDb(dbPath) {
       role TEXT NOT NULL CHECK(role IN ('user','assistant')),
       content TEXT NOT NULL,
       sources TEXT,
+      images TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS extracted_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      document_id INTEGER NOT NULL,
+      page_number INTEGER,
+      image_path TEXT NOT NULL,
+      mime_type TEXT DEFAULT 'image/png',
+      width INTEGER,
+      height INTEGER,
+      file_size INTEGER NOT NULL,
+      source_type TEXT DEFAULT 'embedded' CHECK(source_type IN ('embedded','page_capture')),
+      context_text TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_extracted_images_doc ON extracted_images(document_id);
+    CREATE INDEX IF NOT EXISTS idx_extracted_images_doc_page ON extracted_images(document_id, page_number);
   `);
 
   // Add better-sqlite3 compatible prepare method
@@ -169,8 +195,66 @@ export async function createDb(dbPath) {
 
   // Ensure existing databases support vision chunk type without manual migration.
   migrateChunksTableForVisionType(db);
+  migrateDocumentsTableForProgress(db);
+  migrateExtractedImagesTable(db);
+  migrateMessagesTableForImages(db);
 
   return db;
+}
+
+function hasColumn(db, tableName, columnName) {
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  return cols.some((col) => String(col.name) === columnName);
+}
+
+function migrateDocumentsTableForProgress(db) {
+  const additions = [
+    ["ai_title_short", "TEXT"],
+    ["ai_summary", "TEXT"],
+    ["progress_percent", "REAL DEFAULT 0"],
+    ["processing_stage", "TEXT"],
+    ["status_message", "TEXT"],
+    ["chunks_total", "INTEGER DEFAULT 0"],
+    ["chunks_processed", "INTEGER DEFAULT 0"],
+    ["extracted_image_count", "INTEGER DEFAULT 0"],
+  ];
+
+  for (const [name, definition] of additions) {
+    if (!hasColumn(db, "documents", name)) {
+      db.exec(`ALTER TABLE documents ADD COLUMN ${name} ${definition}`);
+    }
+  }
+}
+
+function migrateExtractedImagesTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS extracted_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      document_id INTEGER NOT NULL,
+      page_number INTEGER,
+      image_path TEXT NOT NULL,
+      mime_type TEXT DEFAULT 'image/png',
+      width INTEGER,
+      height INTEGER,
+      file_size INTEGER NOT NULL,
+      source_type TEXT DEFAULT 'embedded' CHECK(source_type IN ('embedded','page_capture')),
+      context_text TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_extracted_images_doc ON extracted_images(document_id);
+    CREATE INDEX IF NOT EXISTS idx_extracted_images_doc_page ON extracted_images(document_id, page_number);
+  `);
+
+  if (!hasColumn(db, "extracted_images", "context_text")) {
+    db.exec("ALTER TABLE extracted_images ADD COLUMN context_text TEXT");
+  }
+}
+
+function migrateMessagesTableForImages(db) {
+  if (!hasColumn(db, "messages", "images")) {
+    db.exec("ALTER TABLE messages ADD COLUMN images TEXT");
+  }
 }
 
 /**

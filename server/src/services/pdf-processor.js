@@ -21,16 +21,21 @@
  *
  * Optional env vars:
  *   GEMINI_VISION_ENABLED       – set to "true" to enable vision (default: false)
- *   GEMINI_VISION_MODEL         – primary model for vision (default: gemini-2.5-flash)
- *   GEMINI_VISION_FALLBACK_MODELS – fallback vision models (default: gemini-1.5-flash)
- *   GEMINI_VISION_PDF_FALLBACK  – use direct PDF->Gemini fallback when page render fails (default: true)
- *   GEMINI_VISION_MAX_PAGES     – max pages sent to Vision API per document (default: 10)
+ *   GEMINI_VISION_MODEL         – primary model for vision (default: gemini-3.1-flash)
+ *   GEMINI_VISION_FALLBACK_MODELS – fallback vision models (default: gemini-2.5-flash,gemini-1.5-flash)
+ *   GEMINI_VISION_PDF_FALLBACK  – allow raster-page fallback when direct PDF coverage is incomplete (default: true)
+ *   GEMINI_VISION_MAX_PAGES     – max pages sent to Vision API per document (default: 0 = all pages)
+ *   GEMINI_VISION_ADAPTIVE_PAGES – route only image-rich/scanned pages to vision (default: true)
+ *   GEMINI_VISION_TEXT_THRESHOLD – text chars threshold for scanned-page fallback routing (default: 20)
+ *   GEMINI_VISION_DIRECT_BATCH_SIZE – pages per direct-PDF vision request (default: 4)
+ *   GEMINI_VISION_FORCE_RASTER   – force raster fallback on unsupported Node versions (default: false)
  *   GEMINI_VISION_TIMEOUT_MS    – overall timeout for the vision step (default: 90000)
  *   PDF_RASTER_SCALE            – render scale factor, 1.5 ≈ 108 DPI (default: 1.5)
  */
 
 import fs from "fs";
 import path from "path";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import pdfParse from "pdf-parse";
 import { chunkDocument } from "./chunker.js";
@@ -40,16 +45,40 @@ import { generateEmbeddings } from "./embedding-generator.js";
 import { upsertVectors } from "./vector-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const uploadsRootDir = path.join(__dirname, "..", "..", "uploads");
+const extractedImagesDir = path.join(uploadsRootDir, "extracted-images");
+
+const STAGE_PROGRESS = {
+  started: 2,
+  parsing: 10,
+  text_split: 18,
+  ocr: 28,
+  image_extract: 38,
+  vision: 54,
+  chunking: 65,
+  chunk_insert_start: 70,
+  bm25: 82,
+  embeddings: 92,
+  finalizing: 98,
+  complete: 100,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_TEXT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro";
+const GEMINI_TEXT_FALLBACK_MODELS = (
+  process.env.GEMINI_FALLBACK_MODELS || "gemini-2.5-flash,gemini-1.5-flash"
+)
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 const GEMINI_VISION_MODEL =
   process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
 const GEMINI_VISION_FALLBACK_MODELS = (
-  process.env.GEMINI_VISION_FALLBACK_MODELS || "gemini-1.5-flash"
+  process.env.GEMINI_VISION_FALLBACK_MODELS || "gemini-1.5-flash,gemini-1.5-pro"
 )
   .split(",")
   .map((m) => m.trim())
@@ -62,11 +91,25 @@ const GEMINI_VISION_ENABLED = ["1", "true", "yes", "on"].includes(
   String(process.env.GEMINI_VISION_ENABLED || "false").toLowerCase(),
 );
 const VISION_MAX_PAGES = parseInt(
-  process.env.GEMINI_VISION_MAX_PAGES ?? "10",
+  process.env.GEMINI_VISION_MAX_PAGES ?? "0",
   10,
 );
+const GEMINI_VISION_ADAPTIVE_PAGES = ["1", "true", "yes", "on"].includes(
+  String(process.env.GEMINI_VISION_ADAPTIVE_PAGES || "true").toLowerCase(),
+);
+const GEMINI_VISION_TEXT_THRESHOLD = parseInt(
+  process.env.GEMINI_VISION_TEXT_THRESHOLD ?? "20",
+  10,
+);
+const GEMINI_VISION_DIRECT_BATCH_SIZE = Math.max(
+  1,
+  parseInt(process.env.GEMINI_VISION_DIRECT_BATCH_SIZE ?? "8", 10) || 8,
+);
+const GEMINI_VISION_FORCE_RASTER = ["1", "true", "yes", "on"].includes(
+  String(process.env.GEMINI_VISION_FORCE_RASTER || "false").toLowerCase(),
+);
 const VISION_TOTAL_TIMEOUT_MS = parseInt(
-  process.env.GEMINI_VISION_TIMEOUT_MS ?? "90000",
+  process.env.GEMINI_VISION_TIMEOUT_MS ?? "300000",
   10,
 );
 
@@ -88,10 +131,24 @@ const RASTER_SCALE = parseFloat(process.env.PDF_RASTER_SCALE ?? "1.5");
  */
 export async function processDocument(db, documentId, filePath) {
   console.log(`[doc:${documentId}] Starting processing: ${filePath}`);
+  setDocumentProgress(db, documentId, {
+    status: "processing",
+    processingStage: "starting",
+    statusMessage: "Starting PDF processing",
+    progressPercent: STAGE_PROGRESS.started,
+    chunksTotal: 0,
+    chunksProcessed: 0,
+    extractedImageCount: 0,
+  });
 
   try {
     const dataBuffer = fs.readFileSync(filePath);
     console.log(`[doc:${documentId}] Read ${dataBuffer.length} bytes`);
+    setDocumentProgress(db, documentId, {
+      processingStage: "parsing",
+      statusMessage: "Parsing PDF",
+      progressPercent: STAGE_PROGRESS.parsing,
+    });
 
     // ------------------------------------------------------------------
     // Step 1 – Text extraction via pdf-parse
@@ -104,20 +161,25 @@ export async function processDocument(db, documentId, filePath) {
     const textPages = splitTextIntoPages(pdfData.text, pdfData.numpages);
     let resolvedTextPages = textPages;
 
-    // If pdf-parse did not preserve page boundaries, recover text using pdfjs per-page extraction
-    // so citations and page navigation remain accurate.
-    if (pdfData.numpages > 1 && textPages.length < pdfData.numpages) {
-      const fallbackPages = await extractTextPagesWithPdfjs(
+    // For multi-page PDFs, prefer true per-page extraction from pdfjs to avoid
+    // wrong page attribution from heuristic splitting.
+    if (pdfData.numpages > 1) {
+      const perPageText = await extractTextPagesWithPdfjs(
         dataBuffer,
         pdfData.numpages,
       );
-      if (fallbackPages.length > 0) {
-        resolvedTextPages = fallbackPages;
+      if (perPageText.length > 0) {
+        resolvedTextPages = perPageText;
       }
     }
     console.log(
       `[doc:${documentId}] Split into ${resolvedTextPages.length} text pages`,
     );
+    setDocumentProgress(db, documentId, {
+      processingStage: "text",
+      statusMessage: "Extracting text by page",
+      progressPercent: STAGE_PROGRESS.text_split,
+    });
 
     db.prepare("UPDATE documents SET page_count = ? WHERE id = ?").run(
       pdfData.numpages,
@@ -131,11 +193,29 @@ export async function processDocument(db, documentId, filePath) {
     console.log(
       `[doc:${documentId}] Legacy OCR: ${ocrPages.length} image pages`,
     );
+    setDocumentProgress(db, documentId, {
+      processingStage: "ocr",
+      statusMessage: "Running OCR on embedded images",
+      progressPercent: STAGE_PROGRESS.ocr,
+    });
+
+    const extractedImageCount = await saveDetectedEmbeddedImages(
+      db,
+      dataBuffer,
+      documentId,
+    );
+    setDocumentProgress(db, documentId, {
+      processingStage: "image-extraction",
+      statusMessage: `Detected ${extractedImageCount} extracted image${extractedImageCount === 1 ? "" : "s"}`,
+      extractedImageCount,
+      progressPercent: STAGE_PROGRESS.image_extract,
+    });
 
     // ------------------------------------------------------------------
     // Step 3 – Gemini Vision page descriptions (pure JS, Windows-safe)
     // ------------------------------------------------------------------
     const visionPages = await describeAllPagesWithGeminiWithTimeout(
+      db,
       dataBuffer,
       pdfData.numpages,
       documentId,
@@ -143,6 +223,19 @@ export async function processDocument(db, documentId, filePath) {
     console.log(
       `[doc:${documentId}] Gemini Vision: ${visionPages.length} pages described`,
     );
+    const totalExtractedImages = Number(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM extracted_images WHERE document_id = ?",
+        )
+        .get(documentId)?.count || 0,
+    );
+    setDocumentProgress(db, documentId, {
+      processingStage: "vision",
+      statusMessage: "Analyzing page visuals",
+      extractedImageCount: totalExtractedImages,
+      progressPercent: STAGE_PROGRESS.vision,
+    });
 
     // ------------------------------------------------------------------
     // Step 4 – Merge all text sources
@@ -162,7 +255,12 @@ export async function processDocument(db, documentId, filePath) {
       chunk_type: "text",
     }));
 
-    const visionRawPages = visionPages.map((p) => ({
+    const visionPagesWithContext = mergeVisionDescriptionsWithImageContext(
+      db,
+      documentId,
+      visionPages,
+    );
+    const visionRawPages = visionPagesWithContext.map((p) => ({
       pageNumber: p.pageNumber,
       text: p.description,
     }));
@@ -177,12 +275,22 @@ export async function processDocument(db, documentId, filePath) {
     console.log(
       `[doc:${documentId}] Chunks: ${textChunks.length} text + ${visionChunks.length} vision = ${allChunks.length} total`,
     );
+    setDocumentProgress(db, documentId, {
+      processingStage: "chunking",
+      statusMessage: `Preparing ${allChunks.length} chunks`,
+      chunksTotal: allChunks.length,
+      chunksProcessed: 0,
+      progressPercent: STAGE_PROGRESS.chunking,
+    });
 
     if (allChunks.length === 0) {
       console.log(`[doc:${documentId}] No chunks created – marking ready`);
-      db.prepare("UPDATE documents SET status = 'ready' WHERE id = ?").run(
-        documentId,
-      );
+      setDocumentProgress(db, documentId, {
+        status: "ready",
+        processingStage: "complete",
+        statusMessage: "Processing complete (no chunks generated)",
+        progressPercent: STAGE_PROGRESS.complete,
+      });
       return;
     }
 
@@ -194,7 +302,9 @@ export async function processDocument(db, documentId, filePath) {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
 
-    for (const chunk of allChunks) {
+    const totalChunks = allChunks.length;
+    for (let i = 0; i < allChunks.length; i++) {
+      const chunk = allChunks[i];
       insertChunk.run(
         documentId,
         chunk.chunk_index,
@@ -204,6 +314,21 @@ export async function processDocument(db, documentId, filePath) {
         chunk.end_offset,
         chunk.chunk_type,
       );
+
+      const processed = i + 1;
+      if (processed === totalChunks || processed % 5 === 0) {
+        const chunkProgress =
+          STAGE_PROGRESS.chunk_insert_start +
+          (processed / totalChunks) *
+            (STAGE_PROGRESS.bm25 - STAGE_PROGRESS.chunk_insert_start - 2);
+        setDocumentProgress(db, documentId, {
+          processingStage: "chunk-insert",
+          statusMessage: `Stored chunk ${processed} of ${totalChunks}`,
+          chunksTotal: totalChunks,
+          chunksProcessed: processed,
+          progressPercent: chunkProgress,
+        });
+      }
     }
     console.log(`[doc:${documentId}] Chunks inserted`);
 
@@ -219,25 +344,58 @@ export async function processDocument(db, documentId, filePath) {
     buildIndex(db, documentId, savedChunks);
     console.log(`[doc:${documentId}] BM25 index built`);
 
+    await updateDocumentSearchMetadata(db, documentId, savedChunks);
+    setDocumentProgress(db, documentId, {
+      processingStage: "indexing",
+      statusMessage: "Building search index",
+      progressPercent: STAGE_PROGRESS.bm25,
+      chunksTotal: savedChunks.length,
+      chunksProcessed: savedChunks.length,
+    });
+
     // ------------------------------------------------------------------
     // Step 8 – Generate embeddings asynchronously (non-blocking)
     // ------------------------------------------------------------------
-    generateAndStoreEmbeddings(db, documentId, savedChunks).catch((err) => {
-      console.error(
-        `[doc:${documentId}] Embedding error (non-fatal):`,
-        err.message,
-      );
+    setDocumentProgress(db, documentId, {
+      processingStage: "embeddings",
+      statusMessage: "Generating embeddings",
+      progressPercent: STAGE_PROGRESS.embeddings,
     });
 
-    db.prepare("UPDATE documents SET status = 'ready' WHERE id = ?").run(
+    await generateAndStoreEmbeddings(
+      db,
       documentId,
+      savedChunks,
+      (fraction) => {
+        const bounded = Math.min(1, Math.max(0, Number(fraction) || 0));
+        const currentProgress =
+          STAGE_PROGRESS.embeddings +
+          bounded * (STAGE_PROGRESS.finalizing - STAGE_PROGRESS.embeddings);
+        setDocumentProgress(db, documentId, {
+          processingStage: "embeddings",
+          statusMessage: `Embedding ${Math.round(bounded * 100)}% complete`,
+          progressPercent: currentProgress,
+        });
+      },
     );
+
+    setDocumentProgress(db, documentId, {
+      status: "ready",
+      processingStage: "complete",
+      statusMessage: "Processing complete",
+      progressPercent: STAGE_PROGRESS.complete,
+      chunksTotal: savedChunks.length,
+      chunksProcessed: savedChunks.length,
+    });
     console.log(`[doc:${documentId}] Processing complete`);
   } catch (err) {
     console.error(`[doc:${documentId}] Fatal error:`, err);
-    db.prepare("UPDATE documents SET status = 'error' WHERE id = ?").run(
-      documentId,
-    );
+    setDocumentProgress(db, documentId, {
+      status: "error",
+      processingStage: "error",
+      statusMessage: String(err?.message || "Processing failed"),
+      progressPercent: 100,
+    });
     throw err;
   }
 }
@@ -377,30 +535,40 @@ async function renderPageToPng(page, createCanvas, scale) {
   const viewport = page.getViewport({ scale });
   const width = Math.round(viewport.width);
   const height = Math.round(viewport.height);
-  const canvas = createCanvas(width, height);
-  const ctx = canvas.getContext("2d");
+  try {
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext("2d");
 
-  await page.render({
-    canvasContext: ctx,
-    viewport,
-    // pdfjs-dist requires a NodeCanvasFactory in Node.js environments
-    canvasFactory: {
-      create(w, h) {
-        const c = createCanvas(w, h);
-        return { canvas: c, context: c.getContext("2d") };
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      canvasFactory: {
+        create(w, h) {
+          const c = createCanvas(w, h);
+          return { canvas: c, context: c.getContext("2d") };
+        },
+        reset(pair, w, h) {
+          pair.canvas.width = w;
+          pair.canvas.height = h;
+          pair.context = pair.canvas.getContext("2d");
+        },
+        destroy() {
+          /* no-op */
+        },
       },
-      reset(pair, w, h) {
-        pair.canvas.width = w;
-        pair.canvas.height = h;
-        pair.context = pair.canvas.getContext("2d");
-      },
-      destroy() {
-        /* no-op – GC handles it */
-      },
-    },
-  }).promise;
+    }).promise;
 
-  return canvas.toBuffer("image/png");
+    return canvas.toBuffer("image/png");
+  } catch (err) {
+    if (!String(err?.message || "").includes("Image or Canvas expected")) {
+      throw err;
+    }
+
+    const fallbackCanvas = createCanvas(width, height);
+    const fallbackCtx = fallbackCanvas.getContext("2d");
+    await page.render({ canvasContext: fallbackCtx, viewport }).promise;
+    return fallbackCanvas.toBuffer("image/png");
+  }
 }
 
 /**
@@ -519,16 +687,17 @@ function shouldTryAnotherVisionModel(status, message) {
 }
 
 /**
- * Rasterise every page of a PDF and send each to Gemini Vision.
+ * Describe all pages with Gemini Vision.
  *
- * Uses pdfjs-dist (pure JavaScript PDF renderer) + canvas (npm native addon).
- * No system binaries are required – works on Windows, Linux, and macOS.
+ * Primary mode: direct PDF upload to Gemini (more robust for many PDFs on Windows).
+ * Secondary mode: raster-page fallback via pdfjs-dist + canvas for pages that are still
+ * missing or short after the direct pass.
  *
  * @param {Buffer} pdfBuffer
  * @param {number} numPages
  * @returns {Promise<Array<{pageNumber: number, description: string}>>}
  */
-async function describeAllPagesWithGemini(pdfBuffer, numPages) {
+async function describeAllPagesWithGemini(db, pdfBuffer, numPages, documentId) {
   if (!GEMINI_VISION_ENABLED) return [];
 
   if (!GEMINI_API_KEY) {
@@ -536,136 +705,392 @@ async function describeAllPagesWithGemini(pdfBuffer, numPages) {
     return [];
   }
 
-  if (VISION_MAX_PAGES === 0) {
-    console.log("[vision] GEMINI_VISION_MAX_PAGES=0 – vision disabled");
+  const pagesToProcess =
+    VISION_MAX_PAGES > 0 ? Math.min(numPages, VISION_MAX_PAGES) : numPages;
+  const pageSelection = await selectVisionPages(pdfBuffer, pagesToProcess);
+  const requestedPages = pageSelection.visionPages;
+
+  console.log(
+    `[vision] Page routing: ${requestedPages.length}/${pagesToProcess} page(s) sent to vision (${pageSelection.skippedPages.length} text-dominant skipped)`,
+  );
+
+  if (requestedPages.length === 0) {
     return [];
   }
 
-  // canvas must be installed
+  const descriptions = [];
+  const describedPageSet = new Set();
+
+  try {
+    console.log(
+      `[vision] Direct PDF pass using ${GEMINI_VISION_MODEL} for ${requestedPages.length} page(s)...`,
+    );
+
+    const batches = chunkNumberArray(
+      requestedPages,
+      GEMINI_VISION_DIRECT_BATCH_SIZE,
+    );
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const directDescriptions = await describePdfWithGeminiDirect(
+        pdfBuffer,
+        batch,
+      );
+      for (const item of directDescriptions) {
+        if (
+          item.description.length <= 20 ||
+          describedPageSet.has(item.pageNumber)
+        ) {
+          continue;
+        }
+        describedPageSet.add(item.pageNumber);
+        descriptions.push(item);
+      }
+      console.log(
+        `[vision] Direct batch ${i + 1}/${batches.length}: ${describedPageSet.size}/${requestedPages.length} pages described`,
+      );
+    }
+
+    console.log(
+      `[vision] Direct PDF described ${descriptions.length}/${requestedPages.length} pages`,
+    );
+  } catch (err) {
+    console.warn(`[vision] Direct PDF pass failed: ${err.message}`);
+  }
+
+  const missingPages = requestedPages.filter((p) => !describedPageSet.has(p));
+  if (missingPages.length === 0) {
+    console.log(
+      `[vision] ${descriptions.length}/${pagesToProcess} pages described successfully`,
+    );
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
+  }
+
+  if (!GEMINI_VISION_PDF_FALLBACK) {
+    console.warn(
+      `[vision] Raster fallback disabled. Missing pages: ${missingPages.join(", ")}`,
+    );
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
+  }
+
+  if (!isRasterFallbackRuntimeSafe()) {
+    console.warn(
+      `[vision] Raster fallback disabled on Node ${process.versions.node} due pdfjs/canvas instability. Missing pages: ${missingPages.join(", ")}`,
+    );
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
+  }
+
+  // Secondary fallback: render only missing pages to PNG and describe them.
   const canvasModule = await getCanvas();
   if (!canvasModule) {
     console.warn(
-      '[vision] "canvas" package not found.\n' +
-        "[vision] Run:  npm install canvas\n" +
-        "[vision] Skipping vision – re-upload the document after installing.",
+      '[vision] "canvas" package not found; unable to run raster fallback for missing pages.',
     );
-    return [];
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
   }
-
   const { createCanvas } = canvasModule;
 
-  // pdfjs-dist must be installed and initialisable
   let pdfjsLib;
   try {
     pdfjsLib = await getPdfjs();
   } catch (err) {
     console.warn(
-      `[vision] Failed to load pdfjs-dist: ${err.message}\n` +
-        "[vision] Run:  npm install pdfjs-dist\n" +
-        "[vision] Skipping vision pass.",
+      `[vision] pdfjs unavailable for raster fallback: ${err.message}`,
     );
-    return [];
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
   }
 
-  // Parse the PDF
   let pdfDoc;
   try {
     pdfDoc = await pdfjsLib.getDocument(
       buildPdfjsLoadOptions(new Uint8Array(pdfBuffer)),
     ).promise;
   } catch (err) {
-    console.warn(`[vision] pdfjs could not parse PDF: ${err.message}`);
-    return [];
+    console.warn(
+      `[vision] pdfjs could not parse PDF for raster fallback: ${err.message}`,
+    );
+    return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
   }
 
-  const pagesToProcess = Math.min(numPages, VISION_MAX_PAGES);
-  const descriptions = [];
-  const failedPages = [];
-
-  for (let i = 1; i <= pagesToProcess; i++) {
+  for (const pageNumber of missingPages) {
     try {
-      console.log(`[vision] Rendering page ${i}/${pagesToProcess}…`);
-      const page = await pdfDoc.getPage(i);
+      console.log(
+        `[vision] Raster fallback rendering page ${pageNumber}/${pagesToProcess}...`,
+      );
+      const page = await pdfDoc.getPage(pageNumber);
       const pngBuffer = await renderPageToPng(page, createCanvas, RASTER_SCALE);
+      const description = await describePageWithGemini(pngBuffer, pageNumber);
+      persistPageCaptureImage(
+        db,
+        documentId,
+        pageNumber,
+        pngBuffer,
+        description,
+      );
       page.cleanup();
 
-      console.log(
-        `[vision] Describing page ${i} (${(pngBuffer.length / 1024).toFixed(0)} KB PNG)…`,
-      );
-      const description = await describePageWithGemini(pngBuffer, i);
-
-      if (description.length > 20) {
-        descriptions.push({ pageNumber: i, description });
+      if (description.length > 20 && !describedPageSet.has(pageNumber)) {
+        describedPageSet.add(pageNumber);
+        descriptions.push({ pageNumber, description });
       }
     } catch (err) {
-      // A single-page failure must never abort the whole document
-      console.warn(`[vision] Page ${i} failed (skipping): ${err.message}`);
-      failedPages.push(i);
-    }
-  }
-
-  if (GEMINI_VISION_PDF_FALLBACK && failedPages.length > 0) {
-    console.warn(
-      `[vision] Attempting direct PDF fallback for pages: ${failedPages.join(", ")}...`,
-    );
-
-    try {
-      const fallbackDescriptions = await describePdfWithGeminiDirect(
-        pdfBuffer,
-        pagesToProcess,
-        failedPages,
+      console.warn(
+        `[vision] Raster fallback failed for page ${pageNumber}: ${err.message}`,
       );
-
-      const existingPages = new Set(descriptions.map((d) => d.pageNumber));
-      for (const item of fallbackDescriptions) {
-        if (!existingPages.has(item.pageNumber)) {
-          descriptions.push(item);
-        }
-      }
-    } catch (err) {
-      console.warn(`[vision] Direct PDF fallback failed: ${err.message}`);
     }
   }
 
   console.log(
     `[vision] ${descriptions.length}/${pagesToProcess} pages described successfully`,
   );
-  return descriptions;
+  return descriptions.sort((a, b) => a.pageNumber - b.pageNumber);
 }
 
 /**
- * Direct PDF -> Gemini Vision fallback when page rasterization fails.
+ * Direct PDF -> Gemini Vision page description pass.
  * @param {Buffer} pdfBuffer
- * @param {number} pagesToProcess
- * @param {number[]} failedPages
+ * @param {number[]} requestedPages
  * @returns {Promise<Array<{pageNumber: number, description: string}>>}
  */
-async function describePdfWithGeminiDirect(
-  pdfBuffer,
-  pagesToProcess,
-  failedPages,
-) {
+async function describePdfWithGeminiDirect(pdfBuffer, requestedPages) {
   const base64 = pdfBuffer.toString("base64");
-  const requestedPages = [...new Set(failedPages)].sort((a, b) => a - b);
+  const normalizedPages = [...new Set(requestedPages)].sort((a, b) => a - b);
 
   const prompt =
-    `You are analyzing a PDF document. Focus ONLY on these pages: ${requestedPages.join(", ")} (max ${pagesToProcess}).\n` +
-    `For each requested page, return this STRICT format:\n` +
-    `PAGE <number>\n` +
-    `OBJECTS: <comma-separated nouns visible; include vehicles like car/bike/bus/truck when present>\n` +
-    `LOGOS_BRANDS: <logos/brands or none>\n` +
-    `TEXT_OCR: <readable text>\n` +
-    `SCENE: <short visual scene>\n` +
-    `LAYOUT: <layout summary>\n` +
-    `---\n` +
-    `Do not include pages outside the requested list.`;
+    `You are analyzing a PDF document. Focus ONLY on these pages: ${normalizedPages.join(", ")}.\n` +
+    `Return ONLY valid JSON as an array of objects with this schema:\n` +
+    `[{"page": <number>, "objects": "...", "logos_brands": "...", "text_ocr": "...", "scene": "...", "layout": "..."}]\n` +
+    `Rules:\n` +
+    `- Include one object per requested page that has meaningful visual content.\n` +
+    `- Do not include pages outside the requested list.\n` +
+    `- Use empty string for unknown fields, not null.\n` +
+    `- Do not include markdown fences.`;
 
   const raw = await invokeGeminiVision([
     { text: prompt },
     { inline_data: { mime_type: "application/pdf", data: base64 } },
   ]);
 
-  return parsePageBlocks(raw, requestedPages);
+  return parseDirectPdfVisionResponse(raw, normalizedPages);
+}
+
+/**
+ * Select pages to run through vision based on page-level signals.
+ * @param {Buffer} pdfBuffer
+ * @param {number} pagesToProcess
+ * @returns {Promise<{visionPages:number[], skippedPages:number[]}>}
+ */
+async function selectVisionPages(pdfBuffer, pagesToProcess) {
+  const allPages = Array.from({ length: pagesToProcess }, (_, i) => i + 1);
+  if (!GEMINI_VISION_ADAPTIVE_PAGES) {
+    return { visionPages: allPages, skippedPages: [] };
+  }
+
+  let pdfjsLib;
+  try {
+    pdfjsLib = await getPdfjs();
+  } catch (err) {
+    console.warn(
+      `[vision] Adaptive routing disabled (pdfjs unavailable): ${err.message}`,
+    );
+    return { visionPages: allPages, skippedPages: [] };
+  }
+
+  let pdfDoc;
+  try {
+    pdfDoc = await pdfjsLib.getDocument(
+      buildPdfjsLoadOptions(new Uint8Array(pdfBuffer)),
+    ).promise;
+  } catch (err) {
+    console.warn(
+      `[vision] Adaptive routing disabled (pdf parse failed): ${err.message}`,
+    );
+    return { visionPages: allPages, skippedPages: [] };
+  }
+
+  const imageOps = buildImageOperatorCodeSet(pdfjsLib);
+  const visionPages = [];
+  const skippedPages = [];
+
+  for (const pageNumber of allPages) {
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+      let textChars = 0;
+      let hasImageOps = false;
+
+      try {
+        const textContent = await page.getTextContent();
+        textChars = (textContent?.items || [])
+          .map((item) => String(item?.str || ""))
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim().length;
+      } catch {
+        textChars = 0;
+      }
+
+      try {
+        const operatorList = await page.getOperatorList();
+        hasImageOps = (operatorList?.fnArray || []).some((fn) =>
+          imageOps.has(fn),
+        );
+      } catch {
+        hasImageOps = false;
+      }
+
+      const isLikelyVisual =
+        hasImageOps || textChars <= GEMINI_VISION_TEXT_THRESHOLD;
+
+      if (isLikelyVisual) {
+        visionPages.push(pageNumber);
+      } else {
+        skippedPages.push(pageNumber);
+      }
+
+      page.cleanup();
+    } catch (err) {
+      // If page analysis fails, err on the side of inclusion.
+      console.warn(
+        `[vision] Page ${pageNumber} analysis failed, routing to vision: ${err.message}`,
+      );
+      visionPages.push(pageNumber);
+    }
+  }
+
+  return {
+    visionPages,
+    skippedPages,
+  };
+}
+
+/**
+ * Build operator code set that indicates image drawing operations in pdfjs.
+ * @param {object} pdfjsLib
+ * @returns {Set<number>}
+ */
+function buildImageOperatorCodeSet(pdfjsLib) {
+  const ops = pdfjsLib?.OPS || {};
+  const candidates = [
+    ops.paintImageXObject,
+    ops.paintInlineImageXObject,
+    ops.paintImageMaskXObject,
+    ops.paintJpegXObject,
+  ];
+  return new Set(candidates.filter((v) => Number.isInteger(v)));
+}
+
+/**
+ * Return whether raster fallback is safe for the current runtime.
+ * Node 24 currently triggers fatal pdfjs canvas errors in this project.
+ * @returns {boolean}
+ */
+function isRasterFallbackRuntimeSafe() {
+  // Opt-out only if explicitly set to 'false'
+  if (process.env.GEMINI_VISION_FORCE_RASTER === "false") return false;
+  return true;
+}
+
+/**
+ * Chunk an array of numbers into fixed-size groups.
+ * @param {number[]} numbers
+ * @param {number} size
+ * @returns {number[][]}
+ */
+function chunkNumberArray(numbers, size) {
+  const chunks = [];
+  for (let i = 0; i < numbers.length; i += size) {
+    chunks.push(numbers.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * Parse direct PDF vision output from JSON-first format with text fallback.
+ * @param {string} text
+ * @param {number[]} allowedPages
+ * @returns {Array<{pageNumber: number, description: string}>}
+ */
+function parseDirectPdfVisionResponse(text, allowedPages) {
+  const fromJson = parseJsonVisionBlocks(text, allowedPages);
+  if (fromJson.length > 0) {
+    return fromJson;
+  }
+  return parsePageBlocks(text, allowedPages);
+}
+
+/**
+ * Parse JSON array output from direct PDF vision pass.
+ * @param {string} text
+ * @param {number[]} allowedPages
+ * @returns {Array<{pageNumber: number, description: string}>}
+ */
+function parseJsonVisionBlocks(text, allowedPages) {
+  const allowed = new Set(allowedPages);
+  const payload = extractJsonPayload(text);
+  if (!payload) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(payload);
+    const rows = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.pages)
+        ? parsed.pages
+        : [];
+
+    return rows
+      .map((row) => {
+        const pageNumber = Number(row?.page ?? row?.page_number ?? 0);
+        const parts = [
+          `OBJECTS: ${String(row?.objects || "").trim()}`,
+          `LOGOS_BRANDS: ${String(row?.logos_brands || "").trim()}`,
+          `TEXT_OCR: ${String(row?.text_ocr || "").trim()}`,
+          `SCENE: ${String(row?.scene || "").trim()}`,
+          `LAYOUT: ${String(row?.layout || "").trim()}`,
+        ];
+        const description = parts.join("\n").trim();
+        return { pageNumber, description };
+      })
+      .filter(
+        (item) =>
+          allowed.has(item.pageNumber) &&
+          item.pageNumber > 0 &&
+          item.description.length > 20,
+      );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Extract a JSON array/object payload from model output.
+ * @param {string} text
+ * @returns {string}
+ */
+function extractJsonPayload(text) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return "";
+
+  const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  const arrayStart = cleaned.indexOf("[");
+  const arrayEnd = cleaned.lastIndexOf("]");
+  if (arrayStart !== -1 && arrayEnd > arrayStart) {
+    return cleaned.slice(arrayStart, arrayEnd + 1);
+  }
+
+  const objStart = cleaned.indexOf("{");
+  const objEnd = cleaned.lastIndexOf("}");
+  if (objStart !== -1 && objEnd > objStart) {
+    return cleaned.slice(objStart, objEnd + 1);
+  }
+
+  return "";
 }
 
 /**
@@ -678,7 +1103,8 @@ function parsePageBlocks(text, allowedPages) {
   const allowed = new Set(allowedPages);
   const results = [];
 
-  const regex = /PAGE\s+(\d+)\s*:\s*([\s\S]*?)(?=\n\s*PAGE\s+\d+\s*:|$)/gi;
+  const regex =
+    /^\s*PAGE\s+(\d+)\s*:?\s*([\s\S]*?)(?=^\s*PAGE\s+\d+\s*:?\s*|^\s*---\s*$|$)/gim;
   let match;
 
   while ((match = regex.exec(text)) !== null) {
@@ -703,6 +1129,59 @@ function parsePageBlocks(text, allowedPages) {
 }
 
 /**
+ * Merge saved extracted-image context into vision page descriptions so
+ * embeddings retain image-specific details even when chunking by page.
+ * @param {object} db
+ * @param {number} documentId
+ * @param {Array<{pageNumber:number,description:string}>} visionPages
+ * @returns {Array<{pageNumber:number,description:string}>}
+ */
+function mergeVisionDescriptionsWithImageContext(db, documentId, visionPages) {
+  if (!Array.isArray(visionPages) || visionPages.length === 0) {
+    return [];
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT page_number, context_text
+       FROM extracted_images
+       WHERE document_id = ?
+         AND page_number IS NOT NULL
+         AND context_text IS NOT NULL
+         AND TRIM(context_text) <> ''
+       ORDER BY id ASC`,
+    )
+    .all(documentId);
+
+  const contextByPage = new Map();
+  for (const row of rows) {
+    const pageNumber = Number(row.page_number || 0);
+    const text = String(row.context_text || "").trim();
+    if (!pageNumber || text.length === 0) continue;
+    if (!contextByPage.has(pageNumber)) {
+      contextByPage.set(pageNumber, []);
+    }
+    if (contextByPage.get(pageNumber).length < 2) {
+      contextByPage.get(pageNumber).push(text.slice(0, 700));
+    }
+  }
+
+  return visionPages.map((page) => {
+    const extras = contextByPage.get(Number(page.pageNumber || 0));
+    if (!extras || extras.length === 0) {
+      return page;
+    }
+
+    return {
+      ...page,
+      description:
+        `${String(page.description || "").trim()}\n\n` +
+        `EXTRACTED_IMAGE_CONTEXT:\n${extras.join("\n")}`,
+    };
+  });
+}
+
+/**
  * Run the vision pass with a hard overall timeout so a slow Gemini response
  * can never stall document processing indefinitely.
  *
@@ -712,6 +1191,7 @@ function parsePageBlocks(text, allowedPages) {
  * @returns {Promise<Array<{pageNumber: number, description: string}>>}
  */
 async function describeAllPagesWithGeminiWithTimeout(
+  db,
   pdfBuffer,
   numPages,
   documentId,
@@ -720,7 +1200,7 @@ async function describeAllPagesWithGeminiWithTimeout(
 
   try {
     return await promiseWithTimeout(
-      describeAllPagesWithGemini(pdfBuffer, numPages),
+      describeAllPagesWithGemini(db, pdfBuffer, numPages, documentId),
       VISION_TOTAL_TIMEOUT_MS,
       `[doc:${documentId}] Vision step timed out after ${VISION_TOTAL_TIMEOUT_MS}ms`,
     );
@@ -851,6 +1331,361 @@ async function extractAndOcrImages(pdfBuffer) {
 }
 
 /**
+ * Persist detected embedded images as PNG files and metadata.
+ * Uses pdfjs callback-based object resolution to correctly handle
+ * FlateDecode, DCT, JPX and all other PDF image stream types.
+ *
+ * @param {object} db
+ * @param {Buffer} pdfBuffer
+ * @param {number} documentId
+ * @returns {Promise<number>}
+ */
+async function saveDetectedEmbeddedImages(db, pdfBuffer, documentId) {
+  db.prepare("DELETE FROM extracted_images WHERE document_id = ?").run(
+    documentId,
+  );
+
+  if (!fs.existsSync(extractedImagesDir)) {
+    fs.mkdirSync(extractedImagesDir, { recursive: true });
+  }
+
+  const canvasModule = await getCanvas();
+  if (!canvasModule?.createCanvas) {
+    console.warn("[images] canvas unavailable; skipping image extraction");
+    return 0;
+  }
+
+  let savedCount = 0;
+
+  // Primary: pdfjs callback-based extraction (handles ALL image types)
+  try {
+    savedCount = await extractImagesWithPdfjs(
+      db,
+      pdfBuffer,
+      documentId,
+      canvasModule,
+    );
+    console.log(`[images] pdfjs extracted ${savedCount} image(s)`);
+  } catch (err) {
+    console.warn(`[images] pdfjs extraction failed: ${err.message}`);
+  }
+
+  if (savedCount > 0) return savedCount;
+
+  // Fallback: raw JPEG byte scan (legacy)
+  const rawImages = findEmbeddedJpegs(pdfBuffer);
+  if (rawImages.length === 0) return 0;
+
+  if (!canvasModule?.loadImage) return 0;
+
+  const insertImage = db.prepare(
+    `INSERT INTO extracted_images (
+      document_id, page_number, image_path, mime_type, width, height, file_size, source_type, context_text
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  for (let i = 0; i < rawImages.length; i++) {
+    try {
+      const loaded = await canvasModule.loadImage(rawImages[i].buffer);
+      const width = Math.max(1, Math.round(loaded.width || 0));
+      const height = Math.max(1, Math.round(loaded.height || 0));
+      const canvas = canvasModule.createCanvas(width, height);
+      canvas.getContext("2d").drawImage(loaded, 0, 0, width, height);
+      const pngBuffer = canvas.toBuffer("image/png");
+      const hash = createHash("sha1")
+        .update(pngBuffer)
+        .digest("hex")
+        .slice(0, 12);
+      const filename = `doc_${documentId}_embedded_${i + 1}_${hash}.png`;
+      fs.writeFileSync(path.join(extractedImagesDir, filename), pngBuffer);
+      insertImage.run(
+        documentId,
+        rawImages[i].estimatedPage || null,
+        filename,
+        "image/png",
+        width,
+        height,
+        pngBuffer.length,
+        "embedded",
+        null,
+      );
+      savedCount += 1;
+    } catch (err) {
+      console.warn(`[images] Legacy image ${i + 1} failed: ${err.message}`);
+    }
+  }
+
+  return savedCount;
+}
+
+/**
+ * Extract images from PDF pages using pdfjs operator lists with callback-based
+ * async object resolution — the correct API for resolving FlateDecode/DCT/JPX
+ * image XObjects that are loaded asynchronously by the pdfjs render pipeline.
+ *
+ * Key insight: page.objs.get(id) throws "not resolved yet" when called
+ * synchronously after getOperatorList(). The callback form
+ * page.objs.get(id, callback) waits for the object to be ready.
+ *
+ * @param {object} db
+ * @param {Buffer} pdfBuffer
+ * @param {number} documentId
+ * @param {object} canvasModule
+ * @returns {Promise<number>}
+ */
+async function extractImagesWithPdfjs(db, pdfBuffer, documentId, canvasModule) {
+  const pdfjsLib = await getPdfjs();
+  const pdfDoc = await pdfjsLib.getDocument(
+    buildPdfjsLoadOptions(new Uint8Array(pdfBuffer)),
+  ).promise;
+
+  const { createCanvas } = canvasModule;
+  const insertImage = db.prepare(
+    `INSERT INTO extracted_images (
+      document_id, page_number, image_path, mime_type, width, height, file_size, source_type, context_text
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  const MIN_DIMENSION = 50;
+  const MIN_BYTES = 2048;
+  const MAX_IMAGES_PER_DOC = 200;
+  const OBJ_RESOLVE_TIMEOUT_MS = 10000;
+
+  let totalSaved = 0;
+  const seenHashes = new Set();
+
+  for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+    if (totalSaved >= MAX_IMAGES_PER_DOC) break;
+
+    let page;
+    try {
+      page = await pdfDoc.getPage(pageNum);
+    } catch (err) {
+      console.warn(`[images] Could not load page ${pageNum}: ${err.message}`);
+      continue;
+    }
+
+    try {
+      const opList = await page.getOperatorList();
+      const ops = pdfjsLib.OPS || {};
+
+      const imageOpCodes = new Set(
+        [
+          ops.paintImageXObject,
+          ops.paintInlineImageXObject,
+          ops.paintImageMaskXObject,
+        ].filter(Number.isInteger),
+      );
+
+      // Collect unique image object IDs from this page's operator list
+      const imageObjIds = [];
+      const seen = new Set();
+      for (let i = 0; i < opList.fnArray.length; i++) {
+        if (!imageOpCodes.has(opList.fnArray[i])) continue;
+        const objId = opList.argsArray[i]?.[0];
+        if (objId && !seen.has(objId)) {
+          seen.add(objId);
+          imageObjIds.push(objId);
+        }
+      }
+
+      if (imageObjIds.length === 0) continue;
+
+      // Resolve each image object using the callback API (async-safe)
+      for (const objId of imageObjIds) {
+        let imgData;
+        try {
+          imgData = await new Promise((resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error(`Timeout resolving ${objId}`)),
+              OBJ_RESOLVE_TIMEOUT_MS,
+            );
+            try {
+              page.objs.get(objId, (obj) => {
+                clearTimeout(timer);
+                resolve(obj);
+              });
+            } catch (e) {
+              clearTimeout(timer);
+              reject(e);
+            }
+          });
+        } catch (err) {
+          console.warn(`[images] Page ${pageNum} ${objId}: ${err.message}`);
+          continue;
+        }
+
+        if (!imgData) continue;
+
+        const width = Number(imgData.width || 0);
+        const height = Number(imgData.height || 0);
+        if (width < MIN_DIMENSION || height < MIN_DIMENSION) continue;
+
+        // Convert raw pixel data to PNG via canvas
+        let pngBuffer;
+        try {
+          const canvas = createCanvas(width, height);
+          const ctx = canvas.getContext("2d");
+          const dataArr = imgData.data;
+
+          if (
+            dataArr instanceof Uint8ClampedArray ||
+            dataArr instanceof Uint8Array
+          ) {
+            const channels = dataArr.length / (width * height);
+            let rgba;
+
+            if (channels === 4) {
+              rgba = new Uint8ClampedArray(dataArr);
+            } else if (channels === 3) {
+              rgba = new Uint8ClampedArray(width * height * 4);
+              for (let p = 0; p < width * height; p++) {
+                rgba[p * 4] = dataArr[p * 3];
+                rgba[p * 4 + 1] = dataArr[p * 3 + 1];
+                rgba[p * 4 + 2] = dataArr[p * 3 + 2];
+                rgba[p * 4 + 3] = 255;
+              }
+            } else if (channels === 1) {
+              rgba = new Uint8ClampedArray(width * height * 4);
+              for (let p = 0; p < width * height; p++) {
+                const v = dataArr[p];
+                rgba[p * 4] = rgba[p * 4 + 1] = rgba[p * 4 + 2] = v;
+                rgba[p * 4 + 3] = 255;
+              }
+            } else {
+              continue;
+            }
+
+            const id = ctx.createImageData(width, height);
+            id.data.set(rgba);
+            ctx.putImageData(id, 0, 0);
+            pngBuffer = canvas.toBuffer("image/png");
+          } else if (canvasModule.loadImage && dataArr) {
+            // Encoded buffer (JPEG bytes etc.)
+            const raw = Buffer.isBuffer(dataArr)
+              ? dataArr
+              : Buffer.from(dataArr);
+            const loaded = await canvasModule.loadImage(raw);
+            ctx.drawImage(loaded, 0, 0, width, height);
+            pngBuffer = canvas.toBuffer("image/png");
+          } else {
+            continue;
+          }
+        } catch (err) {
+          console.warn(
+            `[images] Page ${pageNum} ${objId} render: ${err.message}`,
+          );
+          continue;
+        }
+
+        if (!pngBuffer || pngBuffer.length < MIN_BYTES) continue;
+
+        const hash = createHash("sha1")
+          .update(pngBuffer)
+          .digest("hex")
+          .slice(0, 12);
+        if (seenHashes.has(hash)) continue;
+        seenHashes.add(hash);
+
+        const filename = `doc_${documentId}_p${pageNum}_${objId}_${hash}.png`;
+        try {
+          fs.writeFileSync(path.join(extractedImagesDir, filename), pngBuffer);
+          insertImage.run(
+            documentId,
+            pageNum,
+            filename,
+            "image/png",
+            width,
+            height,
+            pngBuffer.length,
+            "embedded",
+            null,
+          );
+          totalSaved += 1;
+          console.log(`[images] Saved ${filename} (${width}x${height})`);
+        } catch (err) {
+          console.warn(`[images] Failed to save ${filename}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[images] Page ${pageNum} error: ${err.message}`);
+    } finally {
+      page.cleanup();
+    }
+  }
+
+  return totalSaved;
+}
+
+function persistPageCaptureImage(
+  db,
+  documentId,
+  pageNumber,
+  pngBuffer,
+  contextText,
+) {
+  if (!fs.existsSync(extractedImagesDir)) {
+    fs.mkdirSync(extractedImagesDir, { recursive: true });
+  }
+
+  const hash = createHash("sha1").update(pngBuffer).digest("hex").slice(0, 12);
+  const filename = `doc_${documentId}_page_${pageNumber}_${hash}.png`;
+  const absolutePath = path.join(extractedImagesDir, filename);
+  fs.writeFileSync(absolutePath, pngBuffer);
+
+  const existing = db
+    .prepare(
+      `SELECT id, image_path FROM extracted_images
+       WHERE document_id = ? AND page_number = ? AND source_type = 'page_capture'
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(documentId, pageNumber);
+
+  if (existing?.id) {
+    if (existing.image_path) {
+      const oldPath = path.join(extractedImagesDir, existing.image_path);
+      if (fs.existsSync(oldPath)) {
+        fs.unlinkSync(oldPath);
+      }
+    }
+    db.prepare(
+      `UPDATE extracted_images
+       SET image_path = ?, mime_type = ?, width = ?, height = ?, file_size = ?, context_text = ?
+       WHERE id = ?`,
+    ).run(
+      filename,
+      "image/png",
+      null,
+      null,
+      pngBuffer.length,
+      String(contextText || "").slice(0, 4000) || null,
+      existing.id,
+    );
+    return existing.id;
+  }
+
+  const info = db
+    .prepare(
+      `INSERT INTO extracted_images (
+        document_id, page_number, image_path, mime_type, width, height, file_size, source_type, context_text
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      documentId,
+      pageNumber,
+      filename,
+      "image/png",
+      null,
+      null,
+      pngBuffer.length,
+      "page_capture",
+      String(contextText || "").slice(0, 4000) || null,
+    );
+
+  return Number(info?.lastInsertRowid || 0);
+}
+
+/**
  * Find JPEG blobs embedded in a raw PDF buffer by scanning for magic bytes.
  */
 function findEmbeddedJpegs(buffer) {
@@ -887,7 +1722,12 @@ function findEmbeddedJpegs(buffer) {
 /**
  * Generate embeddings for all chunks and upsert to Pinecone.
  */
-async function generateAndStoreEmbeddings(db, documentId, savedChunks) {
+async function generateAndStoreEmbeddings(
+  db,
+  documentId,
+  savedChunks,
+  onProgress,
+) {
   if (savedChunks.length === 0) return;
 
   if (savedChunks.length > 50) {
@@ -897,7 +1737,13 @@ async function generateAndStoreEmbeddings(db, documentId, savedChunks) {
   }
 
   const chunkTexts = savedChunks.map((c) => c.content);
+  if (typeof onProgress === "function") {
+    onProgress(0.15);
+  }
   const embeddings = await generateEmbeddings(chunkTexts);
+  if (typeof onProgress === "function") {
+    onProgress(0.75);
+  }
 
   const vectors = savedChunks.map((chunk, i) => ({
     id: `chunk_${chunk.id}`,
@@ -911,7 +1757,221 @@ async function generateAndStoreEmbeddings(db, documentId, savedChunks) {
   }));
 
   await upsertVectors(vectors);
+  if (typeof onProgress === "function") {
+    onProgress(1);
+  }
   console.log(
     `[doc:${documentId}] Stored ${vectors.length} embeddings in Pinecone`,
+  );
+}
+
+/**
+ * Generate and persist AI search metadata for document discovery.
+ * @param {object} db
+ * @param {number} documentId
+ * @param {Array<{content:string}>} savedChunks
+ */
+async function updateDocumentSearchMetadata(db, documentId, savedChunks) {
+  const doc = db
+    .prepare("SELECT original_name FROM documents WHERE id = ?")
+    .get(documentId);
+
+  const fallbackTitle = deriveTitleFromFilename(
+    doc?.original_name || "document",
+  );
+  const textSample = (savedChunks || [])
+    .slice(0, 8)
+    .map((chunk) => String(chunk.content || "").trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 5000);
+
+  if (!textSample) {
+    db.prepare(
+      "UPDATE documents SET ai_title_short = ?, ai_summary = ? WHERE id = ?",
+    ).run(fallbackTitle, fallbackTitle, documentId);
+    return;
+  }
+
+  const metadata = await generateSearchMetadataWithGemini(
+    textSample,
+    fallbackTitle,
+  );
+
+  db.prepare(
+    "UPDATE documents SET ai_title_short = ?, ai_summary = ? WHERE id = ?",
+  ).run(metadata.title, metadata.summary, documentId);
+}
+
+/**
+ * Generate 1-5 word title and concise summary using Gemini with fallback.
+ * @param {string} textSample
+ * @param {string} fallbackTitle
+ * @returns {Promise<{title:string, summary:string}>}
+ */
+async function generateSearchMetadataWithGemini(textSample, fallbackTitle) {
+  const defaultMetadata = {
+    title: clampWords(fallbackTitle, 5),
+    summary: textSample.split(/\s+/).slice(0, 24).join(" "),
+  };
+
+  if (!GEMINI_API_KEY) {
+    return defaultMetadata;
+  }
+
+  const prompt =
+    "You are generating searchable metadata for a PDF document list. " +
+    "Return ONLY valid JSON with keys title and summary. " +
+    "title must be 1 to 5 words, no file extension. " +
+    "summary must be one concise sentence under 20 words. " +
+    "Do not use markdown fences.";
+
+  const body = {
+    contents: [
+      {
+        parts: [{ text: prompt }, { text: `Document excerpt:\n${textSample}` }],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 256,
+    },
+  };
+
+  const candidateModels = [
+    GEMINI_TEXT_MODEL,
+    ...GEMINI_TEXT_FALLBACK_MODELS.filter((m) => m !== GEMINI_TEXT_MODEL),
+  ];
+
+  for (let i = 0; i < candidateModels.length; i++) {
+    const modelName = candidateModels[i];
+    const url = `${GEMINI_API_BASE}/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45_000),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        const message =
+          errBody?.error?.message || `Gemini HTTP ${response.status}`;
+        if (
+          i < candidateModels.length - 1 &&
+          shouldTryAnotherVisionModel(response.status, message)
+        ) {
+          continue;
+        }
+        break;
+      }
+
+      const data = await response.json();
+      const raw = extractGeminiResponseText(data);
+      const jsonPayload = extractJsonPayload(raw);
+      if (!jsonPayload) {
+        continue;
+      }
+
+      const parsed = JSON.parse(jsonPayload);
+      const title = clampWords(
+        String(parsed?.title || fallbackTitle)
+          .replace(/\.pdf$/i, "")
+          .trim(),
+        5,
+      );
+      const summary = String(parsed?.summary || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 180);
+
+      return {
+        title: title || defaultMetadata.title,
+        summary: summary || defaultMetadata.summary,
+      };
+    } catch {
+      // Try next fallback model.
+    }
+  }
+
+  return defaultMetadata;
+}
+
+/**
+ * Derive a compact title from original filename.
+ * @param {string} originalName
+ * @returns {string}
+ */
+function deriveTitleFromFilename(originalName) {
+  return clampWords(
+    String(originalName || "document")
+      .replace(/\.pdf$/i, "")
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    5,
+  );
+}
+
+/**
+ * Keep only first N words.
+ * @param {string} text
+ * @param {number} maxWords
+ * @returns {string}
+ */
+function clampWords(text, maxWords) {
+  return String(text || "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, maxWords)
+    .join(" ");
+}
+
+/**
+ * Update processing telemetry for a document.
+ * @param {object} db
+ * @param {number} documentId
+ * @param {object} patch
+ */
+function setDocumentProgress(db, documentId, patch) {
+  const updates = [];
+  const params = [];
+
+  if (typeof patch.status === "string") {
+    updates.push("status = ?");
+    params.push(patch.status);
+  }
+  if (typeof patch.processingStage === "string") {
+    updates.push("processing_stage = ?");
+    params.push(patch.processingStage);
+  }
+  if (typeof patch.statusMessage === "string") {
+    updates.push("status_message = ?");
+    params.push(patch.statusMessage);
+  }
+  if (typeof patch.progressPercent === "number") {
+    const bounded = Math.max(0, Math.min(100, patch.progressPercent));
+    updates.push("progress_percent = ?");
+    params.push(Math.round(bounded * 100) / 100);
+  }
+  if (typeof patch.chunksTotal === "number") {
+    updates.push("chunks_total = ?");
+    params.push(Math.max(0, Math.trunc(patch.chunksTotal)));
+  }
+  if (typeof patch.chunksProcessed === "number") {
+    updates.push("chunks_processed = ?");
+    params.push(Math.max(0, Math.trunc(patch.chunksProcessed)));
+  }
+  if (typeof patch.extractedImageCount === "number") {
+    updates.push("extracted_image_count = ?");
+    params.push(Math.max(0, Math.trunc(patch.extractedImageCount)));
+  }
+
+  if (updates.length === 0) return;
+  params.push(documentId);
+  db.prepare(`UPDATE documents SET ${updates.join(", ")} WHERE id = ?`).run(
+    ...params,
   );
 }

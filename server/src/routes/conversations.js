@@ -76,10 +76,11 @@ export function createConversationRoutes(db) {
           )
           .all(conv.id);
 
-    // Parse sources JSON
+    // Parse persisted JSON payloads
     const parsed = messages.map((m) => ({
       ...m,
       sources: m.sources ? JSON.parse(m.sources) : null,
+      images: m.images ? JSON.parse(m.images) : [],
     }));
 
     res.json(parsed);
